@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as Data
+import numpy as np
 
 torch.manual_seed(1)
 # 默认torch.cuda.is_available() == True
@@ -38,35 +39,9 @@ def preprocess(file_path):
     return data  # [([word], [tag]), ...]
 
 
-# Helper functions
-def argmax(vec):
-    # return the argmax as a python int
-    _, idx = torch.max(vec, 1)
-    return idx.item()
-
-
 def prepare_sequence(seq, to_ix):
     idxs = [to_ix[w] for w in seq]
     return torch.tensor(idxs, dtype=torch.long)
-
-
-# Compute log sum exp in a numerically stable way for the forward algorithm
-def log_sum_exp(vec):
-    # vec: [batch=1, seq_len]
-    max_score = vec[0, argmax(vec)]
-    max_score_broadcast = max_score.view(1, -1).expand(1, vec.size()[1])
-    return max_score + \
-        torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
-    # 等同于return torch.log(torch.sum(torch.exp(vec)))
-
-
-def log_sum_exp_batch(vec):
-    # vec: [batch, seq_len]
-    batch = vec.size()[0]
-    max_score = torch.max(vec, dim=1)[0]
-    max_score_broadcast = max_score.view(batch, -1).expand(batch, vec.size()[1])
-    return max_score + \
-        torch.log(torch.sum(torch.exp(vec - max_score_broadcast), dim=1))  # [batch]
 
 
 class BiLSTM_CRF(nn.Module):
@@ -96,7 +71,11 @@ class BiLSTM_CRF(nn.Module):
         self.transitions.data[tag_to_ix[START_TAG], :] = -10000
         self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
 
-        self.hidden = self.init_hidden()
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_normal_(self.word_embeds.weight)
+        nn.init.xavier_normal_(self.hidden2tag.weight)
 
     def init_hidden(self, batch=1):
         return (torch.randn(2, batch, self.hidden_dim // 2).cuda(),
@@ -104,51 +83,39 @@ class BiLSTM_CRF(nn.Module):
 
     def _forward_alg(self, feats):
         # feats: [batch, seq_len, tag_size]
+        batch, seq_len, tag_size = feats.size()
         # Do the forward algorithm to compute the partition function
-        init_alphas = torch.full((1, self.tagset_size), -10000.).cuda()
+        alpha = torch.full((batch, self.tagset_size), -10000).cuda()
         # START_TAG has all of the score.
-        init_alphas[:, self.tag_to_ix[START_TAG]] = 0.
+        alpha[:, self.tag_to_ix[START_TAG]] = 0
 
-        # Wrap in a variable so that we will get automatic backprop
-        forward_var = init_alphas
-        convert_feats = feats.permute(1, 0, 2)  # [seq_len, batch, tag_size]
+        convert_feats = feats.transpose(0, 1)  # [seq_len, batch, tag_size]
 
         # Iterate through the sentence
-        # 迭代单词w_i
         for feat in convert_feats:  # [batch, tag_size]
-            batch = feat.size()[0]
-            alphas_t = []  # The forward tensors at this timestep
-            for next_tag in range(self.tagset_size):
-                # broadcast the emission score: it is the same regardless of
-                # the previous tag
-                emit_score = feat[:, next_tag].view(
-                    batch, -1).expand(batch, self.tagset_size)  # BiLSTM的输出矩阵(P)
-                # the ith entry of trans_score is the score of transitioning to
-                # next_tag from i
-                trans_score = self.transitions[next_tag].view(1, -1)  # CRF的转移矩阵(A)
-                # The ith entry of next_tag_var is the value for the
-                # edge (i -> next_tag) before we do log-sum-exp
-                next_tag_var = forward_var + trans_score + emit_score  # emit_score有broadcast，next_tag_var: [batch,
-                # tag_size]
-                # The forward variable for this tag is log-sum-exp of all the
-                # scores.
-                alphas_t.append(log_sum_exp_batch(next_tag_var).view(-1, 1))
-            forward_var = torch.cat(alphas_t, dim=1)  # [batch, tag_size]
-        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]  # transitions有broadcast
-        alpha = log_sum_exp_batch(terminal_var)
-        return alpha  # [batch]
+            # [batch, next_tag, current_tag]
+            # emit_score is the same regardless of current_tag,
+            # so we broadcast along current_tag dimension
+            emit_score = feat.unsqueeze(-1)
+            # alpha is the same regardless of next_tag,
+            # so we broadcast along next_tag dimension
+            alpha = alpha.unsqueeze(1) + self.transitions + emit_score  # [batch, tag_size, tag_size]
+            # log_sum_exp along current_tag dimension to get next_tag alpha
+            alpha = torch.logsumexp(alpha, dim=-1)  # [batch, tag_size]
+        alpha = alpha + self.transitions[self.tag_to_ix[STOP_TAG]]
+        return torch.logsumexp(alpha, dim=-1)  # [batch]
 
     def _get_lstm_features(self, sentence):
         # sentence: [batch, seq_len]
-        self.hidden = self.init_hidden(batch=sentence.size()[0])
+        hidden = self.init_hidden(batch=sentence.size()[0])
         embeds = self.word_embeds(sentence)  # [batch, seq_len, embed_dim]
-        lstm_out, self.hidden = self.lstm(embeds, self.hidden)  # lstm_out: [batch, seq_len, hidden_dim]
+        lstm_out, hidden = self.lstm(embeds, hidden)  # lstm_out: [batch, seq_len, hidden_dim]
         lstm_feats = self.hidden2tag(lstm_out)
         return lstm_feats  # [batch, seq_len, tag_size]
 
     def _score_sentence(self, feats, tags):
         # feats: [batch, seq_len, tag_size]
-        # tags: [batch, tag_size]
+        # tags: [batch, seq_len]
         batch = feats.size()[0]
         # Gives the score of a provided tag sequence
         score = torch.zeros(batch).cuda()
@@ -156,104 +123,47 @@ class BiLSTM_CRF(nn.Module):
 
         tags = torch.cat((var, tags), dim=1)  # 拼接START_TAG
         for i in range(feats.size()[1]):
-            feat = feats[:, i, :]
+            feat = feats[:, i, :]  # [batch, tag_size]
             score = score + \
                 self.transitions[tags[:, i + 1], tags[:, i]] + feat[:, tags[:, i + 1]]
         score = score + self.transitions[self.tag_to_ix[STOP_TAG], tags[:, -1]]
-        return score
+        return score  # [batch]
 
     def _viterbi_decode(self, feats):
-        backpointers = []
+        # feats: [batch, seq_len, tag_size]
+        batch, seq_len, tag_size = feats.size()
+        pointers = []
 
         # Initialize the viterbi variables in log space
-        init_vvars = torch.full((1, self.tagset_size), -10000.).cuda()
-        init_vvars[0][self.tag_to_ix[START_TAG]] = 0
+        scores = torch.full((batch, tag_size), -10000).cuda()
+        scores[:, self.tag_to_ix[START_TAG]] = 0
 
-        # forward_var at step i holds the viterbi variables for step i-1
-        forward_var = init_vvars
-        convert_feats = feats.squeeze(0)
+        # scores at step i holds the viterbi variables for step i-1
+        convert_feats = feats.permute(1, 0, 2)
         for feat in convert_feats:
-            bptrs_t = []  # holds the backpointers for this step
-            viterbivars_t = []  # holds the viterbi variables for this step
+            # feat: [batch, tag_size]
+            # [batch, next_tag, current_tag]
+            scores = scores.unsqueeze(1) + self.transitions # [batch, tag_size, tag_size]
+            # max along current_tag to obtain: next_tag score, current_tag pointer
+            scores, pointer = torch.max(scores, -1)
+            scores = scores + feat  # [batch, tag_size]
+            pointers.append(pointer)
+        pointers = torch.stack(pointers, 0).permute(1, 0, 2)  # [batch, seq_len, tag_size]
+        scores = scores + self.transitions[self.tag_to_ix[STOP_TAG]]
+        best_score, best_tag = torch.max(scores, -1)  # [batch]
 
-            for next_tag in range(self.tagset_size):
-                # next_tag_var[i] holds the viterbi variable for tag i at the
-                # previous step, plus the score of transitioning
-                # from tag i to next_tag.
-                # We don't include the emission scores here because the max
-                # does not depend on them (we add them in below)
-                next_tag_var = forward_var + self.transitions[next_tag]
-                best_tag_id = argmax(next_tag_var)
-                bptrs_t.append(best_tag_id)
-                viterbivars_t.append(next_tag_var[0][best_tag_id].view(1))
-            # Now add in the emission scores, and assign forward_var to the set
-            # of viterbi variables we just computed
-            forward_var = (torch.cat(viterbivars_t) + feat).view(1, -1)
-            backpointers.append(bptrs_t)
-
-        # Transition to STOP_TAG
-        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
-        best_tag_id = argmax(terminal_var)
-        path_score = terminal_var[0][best_tag_id]
-
-        # Follow the back pointers to decode the best path.
-        best_path = [best_tag_id]
-        for bptrs_t in reversed(backpointers):
-            best_tag_id = bptrs_t[best_tag_id]
-            best_path.append(best_tag_id)
-        # Pop off the start tag (we dont want to return that to the caller)
-        start = best_path.pop()
-        assert start == self.tag_to_ix[START_TAG]  # Sanity check
-        best_path.reverse()
-        return path_score, best_path
-
-    def _viterbi_decode_parallel(self, feats_list):
-        # 输出预测序列的路径
-        path_list = []
-        for feats in feats_list:
-            backpointers = []
-
-            # Initialize the viterbi variables in log space
-            init_vvars = torch.full((1, self.tagset_size), -10000.).cuda()
-            init_vvars[0][self.tag_to_ix[START_TAG]] = 0
-
-            # forward_var at step i holds the viterbi variables for step i-1
-            forward_var = init_vvars
-            for feat in feats:
-                bptrs_t = []  # holds the backpointers for this step
-                viterbivars_t = []  # holds the viterbi variables for this step
-
-                for next_tag in range(self.tagset_size):
-                    # next_tag_var[i] holds the viterbi variable for tag i at the
-                    # previous step, plus the score of transitioning
-                    # from tag i to next_tag.
-                    # We don't include the emission scores here because the max
-                    # does not depend on them (we add them in below)
-                    next_tag_var = forward_var + self.transitions[next_tag]
-                    best_tag_id = argmax(next_tag_var)
-                    bptrs_t.append(best_tag_id)
-                    viterbivars_t.append(next_tag_var[0][best_tag_id].view(1))
-                # Now add in the emission scores, and assign forward_var to the set
-                # of viterbi variables we just computed
-                forward_var = (torch.cat(viterbivars_t) + feat).view(1, -1)
-                backpointers.append(bptrs_t)
-
-            # Transition to STOP_TAG
-            terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
-            best_tag_id = argmax(terminal_var)
-            path_score = terminal_var[0][best_tag_id]
-
-            # Follow the back pointers to decode the best path.
-            best_path = [best_tag_id]
-            for bptrs_t in reversed(backpointers):
-                best_tag_id = bptrs_t[best_tag_id]
-                best_path.append(best_tag_id)
+        # Follow the back poinnters to decode the best path
+        best_path = best_tag.unsqueeze(-1).tolist()
+        for i in range(batch):
+            best_tag_i = best_tag[i]
+            for ptr_t in reversed(pointers[i]):
+                best_tag_i = ptr_t[best_tag_i].item()
+                best_path[i].append(best_tag_i)
             # Pop off the start tag (we dont want to return that to the caller)
-            start = best_path.pop()
+            start = best_path[i].pop()
             assert start == self.tag_to_ix[START_TAG]  # Sanity check
-            best_path.reverse()
-            path_list.append(best_path)
-        return path_list
+            best_path[i].reverse()
+        return best_path
 
     def neg_log_likelihood(self, sentence, tags):
         # 损失函数
@@ -268,49 +178,18 @@ class BiLSTM_CRF(nn.Module):
         lstm_feats = self._get_lstm_features(sentence)
 
         # Find the best path, given the features.
-        score, tag = self._viterbi_decode(lstm_feats)
-        return score, tag
-
-    def predict(self, sentence):
-        # Get the emission scores from the BiLSTM
-        lstm_feats = self._get_lstm_features(sentence)
-
-        # Find the best path, given the features.
-        tag_seq_list = self._viterbi_decode_parallel(lstm_feats)
+        tag_seq_list = self._viterbi_decode(lstm_feats)
         return tag_seq_list
 
 
-if __name__ == '__main__':
-    START_TAG = "<START>"
-    STOP_TAG = "<STOP>"
-    PAD_TAG = "<PAD>"
-    EMBEDDING_DIM = 50
-    HIDDEN_DIM = 100
-    BATCH_SIZE = 64
-    max_seq_len = 100
-    num_epochs = 15
-
-    training_data = preprocess("data/conll.train")
-
-    word_to_ix = {}
-    word_to_ix[PAD_TAG] = 0
-    tag_to_ix = {START_TAG: 0, STOP_TAG: 1, PAD_TAG: 2}
-    for sentence, tags in training_data:
-        for word in sentence:
-            if word not in word_to_ix:
-                word_to_ix[word] = len(word_to_ix)
-        for tag in tags:
-            if tag not in tag_to_ix:
-                tag_to_ix[tag] = len(tag_to_ix)
-
+def train():
     word_set = []
     tag_set = []
     for sentence, tags in training_data:
         word_set.append([word_to_ix[word] for word in sentence])
         tag_set.append([tag_to_ix[tag] for tag in tags])
 
-    print("word_set:", len(word_set))
-    print("tag_size:", len(tag_to_ix))
+    print("train_size:", len(word_set))
 
     train_set = Data.TensorDataset(torch.tensor(word_set, dtype=torch.long), torch.tensor(tag_set, dtype=torch.long))
     train_loader = Data.DataLoader(
@@ -347,3 +226,58 @@ if __name__ == '__main__':
     with torch.no_grad():
         precheck_sent = prepare_sequence(training_data[1][0], word_to_ix).view(1, -1).cuda()
         print(model(precheck_sent))
+
+
+def test():
+    word_set = []
+    tag_set = []
+    for sentence, tags in test_data:
+        word_set.append([word_to_ix[word] for word in sentence])
+        tag_set.append([tag_to_ix[tag] for tag in tags])
+
+    print("test_size:", len(word_set))
+
+    test_set = Data.TensorDataset(torch.tensor(word_set, dtype=torch.long), torch.tensor(tag_set, dtype=torch.long))
+    test_loader = Data.DataLoader(
+        dataset=test_set,
+        batch_size=BATCH_SIZE
+    )
+
+    model = torch.load("model/bilstm_crf.pkl").cuda()
+    for batch in test_loader:
+        sentence, tags = batch
+        ans = model(sentence.clone().detach().cuda())  # [[], [], ...]
+        # TODO: batch evaluate
+
+
+if __name__ == '__main__':
+    START_TAG = "<START>"
+    STOP_TAG = "<STOP>"
+    PAD_TAG = "<PAD>"
+    EMBEDDING_DIM = 50
+    HIDDEN_DIM = 100
+    BATCH_SIZE = 32
+    max_seq_len = 100
+    num_epochs = 15
+
+    training_data = preprocess("data/conll.train")
+    test_data = preprocess("data/conll.test")
+
+    word_to_ix = {PAD_TAG: 0}
+    tag_to_ix = {START_TAG: 0, STOP_TAG: 1, PAD_TAG: 2}
+    for sentence, tags in training_data:
+        for word in sentence:
+            if word not in word_to_ix:
+                word_to_ix[word] = len(word_to_ix)
+        for tag in tags:
+            if tag not in tag_to_ix:
+                tag_to_ix[tag] = len(tag_to_ix)
+    for sentence, _ in test_data:
+        for word in sentence:
+            if word not in word_to_ix:
+                word_to_ix[word] = len(word_to_ix)
+
+    print(tag_to_ix)
+
+    train()
+    # test()
