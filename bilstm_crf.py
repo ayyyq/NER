@@ -3,9 +3,13 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as Data
 import numpy as np
+import io
 
 torch.manual_seed(1)
+
+
 # 默认torch.cuda.is_available() == True
+
 
 def preprocess(file_path):
     """
@@ -39,8 +43,43 @@ def preprocess(file_path):
     return data  # [([word], [tag]), ...]
 
 
+def get_embeddings(word_embeddings_path, embedding_size):
+    word2idx = {}
+    idx2word = {}
+    word_embeddings = []
+
+    word2idx[PAD_TAG] = len(word2idx)
+    idx2word[0] = PAD_TAG
+    word_embeddings.append(np.zeros(embedding_size))
+
+    word2idx[UNKNOWN] = len(word2idx)  # roughly 3% of the training set
+    idx2word[1] = UNKNOWN
+    word_embeddings.append(np.random.uniform(-0.25, 0.25, embedding_size))
+
+    with io.open(word_embeddings_path, 'r', encoding="utf-8") as f_em:
+        for line in f_em:
+            split = line.strip().split(" ")
+            if len(split) <= 2:
+                continue
+            if len(split) - 1 != embedding_size:
+                continue
+            word_embeddings.append(np.asarray(split[1:], dtype='float32'))
+            word2idx[split[0]] = len(word2idx)
+            idx2word[len(word2idx) - 1] = split[0]
+
+    word_embeddings = np.array(word_embeddings, dtype='float32')
+
+    return word_embeddings, word2idx, idx2word
+
+
 def prepare_sequence(seq, to_ix):
-    idxs = [to_ix[w] for w in seq]
+    # idxs = [to_ix[w] for w in seq]
+    idxs = []
+    for w in seq:
+        try:
+            idxs.append(to_ix[w])
+        except:
+            idxs.append(to_ix[UNKNOWN])
     return torch.tensor(idxs, dtype=torch.long)
 
 
@@ -54,7 +93,8 @@ class BiLSTM_CRF(nn.Module):
         self.tag_to_ix = tag_to_ix
         self.tagset_size = len(tag_to_ix)
 
-        self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
+        self.word_embeds = nn.Embedding.from_pretrained(torch.Tensor(word_embeddings), freeze=True)
+
         self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2,
                             num_layers=1, bidirectional=True, batch_first=True)  # input: [batch, seq_len, embed_dim]
 
@@ -127,7 +167,7 @@ class BiLSTM_CRF(nn.Module):
         for i in range(feats.size()[1]):
             feat = feats[:, i, :]  # [batch, tag_size]
             score = score + \
-                self.transitions[tags[:, i + 1], tags[:, i]] + feat[:, tags[:, i + 1]]
+                    self.transitions[tags[:, i + 1], tags[:, i]] + feat[:, tags[:, i + 1]]
         score = score + self.transitions[self.tag_to_ix[STOP_TAG], tags[:, -1]]
         return score  # [batch]
 
@@ -145,7 +185,7 @@ class BiLSTM_CRF(nn.Module):
         for feat in convert_feats:
             # feat: [batch, tag_size]
             # [batch, next_tag, current_tag]
-            scores = scores.unsqueeze(1) + self.transitions # [batch, tag_size, tag_size]
+            scores = scores.unsqueeze(1) + self.transitions  # [batch, tag_size, tag_size]
             # max along current_tag to obtain: next_tag score, current_tag pointer
             scores, pointer = torch.max(scores, -1)
             scores = scores + feat  # [batch, tag_size]
@@ -188,7 +228,13 @@ def train():
     word_set = []
     tag_set = []
     for sentence, tags in training_data:
-        word_set.append([word_to_ix[word] for word in sentence])
+        sequence = []
+        for word in sentence:
+            try:
+                sequence.append(word_to_ix[word])
+            except:
+                sequence.append(word_to_ix[UNKNOWN])
+        word_set.append(sequence)
         tag_set.append([tag_to_ix[tag] for tag in tags])
 
     print("train_size:", len(word_set))
@@ -223,28 +269,30 @@ def train():
 
             print("epoch", epoch, ":", step, "/", steps, "loss:", loss.item())
 
-    # torch.save(model, "model/bilstm_crf.pkl")
+    torch.save(model, "model/bilstm_crf.pkl")
 
     with torch.no_grad():
         precheck_sent = prepare_sequence(training_data[1][0], word_to_ix).view(1, -1).cuda()
         print(model(precheck_sent))
-    return model
 
 
-def tag_convert(tag):		# For evaluation using conlleval.perl, which doesn't support the following.
+def tag_convert(tag):  # For evaluation using conlleval.perl, which doesn't support the following.
     if tag == "OUT" or tag == "<PAD>":
         return "O"
     else:
         return tag
 
 
-def test(model):
+def test():
     word_set = []
     tag_set = []
     for sentence, tags in test_data:
         sequence = []
         for word in sentence:
-            sequence.append(word_to_ix[word])
+            try:
+                sequence.append(word_to_ix[word])
+            except:
+                sequence.append(word_to_ix[UNKNOWN])
         word_set.append(sequence)
         tag_set.append([tag_to_ix[tag] for tag in tags])
 
@@ -256,7 +304,7 @@ def test(model):
         batch_size=BATCH_SIZE
     )
 
-    # model = torch.load("bilstm_crf_32_15.pkl").cuda()
+    model = torch.load("model/bilstm_crf.pkl").cuda()
     predict = []
     for batch in test_loader:
         sentence, tags = batch
@@ -277,39 +325,35 @@ def test(model):
                     # Note that sentence and tags are tensors, but ans are not tensors.
             f.write('\n')
 
+
 if __name__ == '__main__':
     START_TAG = "<START>"
     STOP_TAG = "<STOP>"
     PAD_TAG = "<PAD>"
+    UNKNOWN = "<UNKNOWN>"
     EMBEDDING_DIM = 50
     HIDDEN_DIM = 100
     BATCH_SIZE = 32
     max_seq_len = 100
     num_epochs = 1
+    word_embeddings_path = '../data/glove.6B.50d.txt'
+    embedding_size = 50
 
     training_data = preprocess("../data/conll.train")
     test_data = preprocess("../data/conll.test")
 
-    word_to_ix = {PAD_TAG: 0}
-    ix_to_word = {0: PAD_TAG}
     tag_to_ix = {START_TAG: 0, STOP_TAG: 1, PAD_TAG: 2}
     ix_to_tag = {0: START_TAG, 1: STOP_TAG, 2: PAD_TAG}
     for sentence, tags in training_data:
-        for word in sentence:
-            if word not in word_to_ix:
-                word_to_ix[word] = len(word_to_ix)
-                ix_to_word[len(ix_to_word)] = word
         for tag in tags:
             if tag not in tag_to_ix:
                 tag_to_ix[tag] = len(tag_to_ix)
                 ix_to_tag[len(ix_to_tag)] = tag
-    for sentence, _ in test_data:
-        for word in sentence:
-            if word not in word_to_ix:
-                word_to_ix[word] = len(word_to_ix)
-                ix_to_word[len(ix_to_word)] = word
+
+    word_embeddings, word_to_ix, ix_to_word = get_embeddings(word_embeddings_path, embedding_size)
 
     print(tag_to_ix)
+    print(ix_to_tag)
 
-    model = train()
-    test(model)
+    train()
+    test()
