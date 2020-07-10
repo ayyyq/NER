@@ -238,12 +238,14 @@ def train():
             sentence = sentence.transpose(0, 1)  # [seq_len, batch]
             tags = tags.transpose(0, 1)
 
-            mask = torch.ne(sentence, torch.tensor(tag_to_ix[PAD_TAG])).float().cuda()  # [seq_len, batch]
+            mask = torch.ne(sentence, torch.tensor(word_to_ix[PAD_TAG])).float().cuda()  # [seq_len, batch]
             length = mask.sum(0)
+            max_length, _ = torch.max(length, 0)
+            max_length = max_length.long().item()
             _, idx = length.sort(0, descending=True)
-            sentence = sentence[:, idx]
-            tags = tags[:, idx]
-            mask = mask[:, idx]
+            sentence = sentence[:max_length, idx]
+            tags = tags[:max_length, idx]
+            mask = mask[:max_length, idx]
 
             loss = model.neg_log_likelihood(sentence.clone().detach().cuda(), tags.clone().detach().cuda(), mask)
 
@@ -293,12 +295,14 @@ def test():
         sentence = sentence.transpose(0, 1)  # [seq_len, batch]
         tags = tags.transpose(0, 1)
 
-        mask = torch.ne(sentence, torch.tensor(tag_to_ix[PAD_TAG])).float().cuda()  # [seq_len, batch]
+        mask = torch.ne(sentence, torch.tensor(word_to_ix[PAD_TAG])).float().cuda()  # [seq_len, batch]
         length = mask.sum(0)
+        max_length, _ = torch.max(length, 0)
+        max_length = max_length.long().item()
         _, idx = length.sort(0, descending=True)
-        sentence = sentence[:, idx]
-        tags = tags[:, idx]
-        mask = mask[:, idx]
+        sentence = sentence[:max_length, idx]
+        tags = tags[:max_length, idx]
+        mask = mask[:max_length, idx]
 
         ans = model(sentence.clone().detach().cuda(), mask)  # [[], [], ...]
 
@@ -310,7 +314,7 @@ def test():
 
     with open("results.txt", "w") as f:
         for sentence, tags, ans in predict:
-            for i in range(max_seq_len):
+            for i in range(len(sentence)):
                 if sentence[i] == word_to_ix[PAD_TAG]:
                     break
                 else:
@@ -328,15 +332,15 @@ if __name__ == '__main__':
     HIDDEN_DIM = 100
     BATCH_SIZE = 32
     max_seq_len = 150
-    num_epochs = 15
+    num_epochs = 100
 
     training_data = preprocess("../data/conll.train")
     test_data = preprocess("../data/conll.test")
 
     word_to_ix = {PAD_TAG: 0}
     ix_to_word = {0: PAD_TAG}
-    tag_to_ix = {START_TAG: 0, STOP_TAG: 1, PAD_TAG: 2}
-    ix_to_tag = {0: START_TAG, 1: STOP_TAG, 2: PAD_TAG}
+    tag_to_ix = {PAD_TAG: 0, START_TAG: 1, STOP_TAG: 2}
+    ix_to_tag = {0: PAD_TAG, 1: START_TAG, 2: STOP_TAG}
     for sentence, tags in training_data:
         for word in sentence:
             if word not in word_to_ix:
