@@ -116,7 +116,7 @@ class BiLSTM_CRF(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.xavier_normal_(self.word_embeds.weight)
+        # nn.init.xavier_normal_(self.word_embeds.weight)
         nn.init.xavier_normal_(self.hidden2tag.weight)
 
     def init_hidden(self, batch=1):
@@ -213,7 +213,7 @@ class BiLSTM_CRF(nn.Module):
         feats = self._get_lstm_features(sentence)  # BiLSTM+Linear层的输出
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
-        return torch.sum(forward_score - gold_score)
+        return torch.sum(forward_score - gold_score) / batch
 
     def forward(self, sentence):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
@@ -277,7 +277,7 @@ def train():
 
 
 def tag_convert(tag):  # For evaluation using conlleval.perl, which doesn't support the following.
-    if tag == "OUT" or tag == "<PAD>":
+    if tag == "OUT" or tag == START_TAG or tag == STOP_TAG or tag == PAD_TAG:
         return "O"
     else:
         return tag
@@ -313,10 +313,10 @@ def test():
         for i in range(len(sentence)):
             predict.append((sentence[i], tags[i], ans[i]))  # Each tuple is a sentence, its tags and its answers.
 
-    with open("../results.txt", "w") as f:
+    with open("results.txt", "w") as f:
         for sentence, tags, ans in predict:
             for i in range(max_seq_len):
-                if sentence[i] == ix_to_word[PAD_TAG]:
+                if sentence[i] == word_to_ix[PAD_TAG]:
                     break
                 else:
                     f.write(ix_to_word[sentence[i].item()] + ' ' \
