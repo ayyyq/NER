@@ -173,7 +173,7 @@ class BiLSTM_CRF(nn.Module):
         feats = self._get_lstm_features(sentence)  # BiLSTM+Linear层的输出
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
-        return torch.sum(forward_score - gold_score)
+        return torch.sum(forward_score - gold_score) / batch
 
     def forward(self, sentence):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
@@ -223,22 +223,21 @@ def train():
 
             print("epoch", epoch, ":", step, "/", steps, "loss:", loss.item())
 
-    # torch.save(model, "model/bilstm_crf.pkl")
+    torch.save(model, "model/bilstm_crf.pkl")
 
     with torch.no_grad():
         precheck_sent = prepare_sequence(training_data[1][0], word_to_ix).view(1, -1).cuda()
         print(model(precheck_sent))
-    return model
 
 
 def tag_convert(tag):		# For evaluation using conlleval.perl, which doesn't support the following.
-    if tag == "OUT" or tag == "<PAD>":
+    if tag == "OUT" or tag == START_TAG or tag == STOP_TAG or tag == PAD_TAG:
         return "O"
     else:
         return tag
 
 
-def test(model):
+def test():
     word_set = []
     tag_set = []
     for sentence, tags in test_data:
@@ -256,7 +255,7 @@ def test(model):
         batch_size=BATCH_SIZE
     )
 
-    # model = torch.load("bilstm_crf_32_15.pkl").cuda()
+    model = torch.load("model/bilstm_crf.pkl").cuda()
     predict = []
     for batch in test_loader:
         sentence, tags = batch
@@ -265,10 +264,10 @@ def test(model):
         for i in range(len(sentence)):
             predict.append((sentence[i], tags[i], ans[i]))  # Each tuple is a sentence, its tags and its answers.
 
-    with open("../results.txt", "w") as f:
+    with open("results.txt", "w") as f:
         for sentence, tags, ans in predict:
             for i in range(max_seq_len):
-                if sentence[i] == ix_to_word[PAD_TAG]:
+                if sentence[i] == word_to_ix[PAD_TAG]:
                     break
                 else:
                     f.write(ix_to_word[sentence[i].item()] + ' ' \
@@ -310,6 +309,7 @@ if __name__ == '__main__':
                 ix_to_word[len(ix_to_word)] = word
 
     print(tag_to_ix)
+    print(ix_to_tag)
 
-    model = train()
-    test(model)
+    train()
+    test()
