@@ -54,9 +54,9 @@ class BiLSTM_CRF(nn.Module):
         self.tag_to_ix = tag_to_ix
         self.tagset_size = len(tag_to_ix)
 
-        self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
+        self.word_embeds = nn.Embedding(vocab_size, embedding_dim, padding_idx=word_to_ix[PAD_TAG])
         self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2,
-                            num_layers=1, bidirectional=True, batch_first=True)  # input: [batch, seq_len, embed_dim]
+                            num_layers=1, bidirectional=True)  # input: [seq_len, batch, embed_dim]
 
         # Maps the output of the LSTM into tag space.
         self.hidden2tag = nn.Linear(hidden_dim, self.tagset_size)
@@ -70,8 +70,6 @@ class BiLSTM_CRF(nn.Module):
         # to the start tag and we never transfer from the stop tag
         self.transitions.data[tag_to_ix[START_TAG], :] = -10000
         self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
-        self.transitions.data[tag_to_ix[PAD_TAG], :] = -10000
-        self.transitions.data[:, tag_to_ix[PAD_TAG]] = -10000
 
         self.reset_parameters()
 
@@ -83,57 +81,66 @@ class BiLSTM_CRF(nn.Module):
         return (torch.randn(2, batch, self.hidden_dim // 2).cuda(),
                 torch.randn(2, batch, self.hidden_dim // 2).cuda())  # [num_layers*num_directions, batch, hidden_size]
 
-    def _forward_alg(self, feats):
-        # feats: [batch, seq_len, tag_size]
-        batch, seq_len, tag_size = feats.size()
+    def _forward_alg(self, feats, mask):
+        # feats: [seq_len, batch, tag_size]
+        # mask: [seq_len, batch]
+        seq_len, batch, tag_size = feats.size()
         # Do the forward algorithm to compute the partition function
         alpha = torch.full((batch, self.tagset_size), -10000).cuda()
         # START_TAG has all of the score.
         alpha[:, self.tag_to_ix[START_TAG]] = 0
 
-        convert_feats = feats.transpose(0, 1)  # [seq_len, batch, tag_size]
-
         # Iterate through the sentence
-        for feat in convert_feats:  # [batch, tag_size]
+        for t, feat in enumerate(feats):  # [batch, tag_size]
             # [batch, next_tag, current_tag]
             # emit_score is the same regardless of current_tag,
             # so we broadcast along current_tag dimension
             emit_score = feat.unsqueeze(-1)
             # alpha is the same regardless of next_tag,
             # so we broadcast along next_tag dimension
-            alpha = alpha.unsqueeze(1) + self.transitions + emit_score  # [batch, tag_size, tag_size]
+            alpha_t = alpha.unsqueeze(1) + self.transitions + emit_score  # [batch, tag_size, tag_size]
+
+            mask_t = mask[t].unsqueeze(-1)
             # log_sum_exp along current_tag dimension to get next_tag alpha
-            alpha = torch.logsumexp(alpha, dim=-1)  # [batch, tag_size]
+            alpha = torch.logsumexp(alpha_t, dim=-1) * mask_t + alpha * (1 - mask_t)  # [batch, tag_size]
+
         alpha = alpha + self.transitions[self.tag_to_ix[STOP_TAG]]
         return torch.logsumexp(alpha, dim=-1)  # [batch]
 
-    def _get_lstm_features(self, sentence):
-        # sentence: [batch, seq_len]
-        hidden = self.init_hidden(batch=sentence.size()[0])
-        embeds = self.word_embeds(sentence)  # [batch, seq_len, embed_dim]
-        lstm_out, hidden = self.lstm(embeds, hidden)  # lstm_out: [batch, seq_len, hidden_dim]
-        lstm_feats = self.hidden2tag(lstm_out)
-        return lstm_feats  # [batch, seq_len, tag_size]
+    def _get_lstm_features(self, sentence, mask):
+        # sentence: [seq_len, batch]
+        # mask: [seq_len, batch]
+        # hidden = self.init_hidden(batch=sentence.size()[1])
+        embeds = self.word_embeds(sentence)  # [seq_len, batch, embed_dim]
+        embeds = nn.utils.rnn.pack_padded_sequence(embeds, mask.sum(0).long())
+        lstm_out, _ = self.lstm(embeds)  # [seq_len, batch, hidden_dim]
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out)
+        lstm_out = lstm_out * mask.unsqueeze(-1)
+        lstm_feats = self.hidden2tag(lstm_out) * mask.unsqueeze(-1)
+        return lstm_feats  # [seq_len, batch, tag_size]
 
-    def _score_sentence(self, feats, tags):
-        # feats: [batch, seq_len, tag_size]
-        # tags: [batch, seq_len]
-        batch = feats.size()[0]
+    def _score_sentence(self, feats, tags, mask):
+        # feats: [seq_len, batch, tag_size]
+        # tags: [seq_len, batch]
+        # mask: [seq_len, batch]
+        batch = feats.size()[1]
         # Gives the score of a provided tag sequence
         score = torch.zeros(batch).cuda()
-        var = torch.full((batch, 1), self.tag_to_ix[START_TAG], dtype=torch.long).cuda()
+        var = torch.full((1, batch), self.tag_to_ix[START_TAG], dtype=torch.long).cuda()
 
-        tags = torch.cat((var, tags), dim=1)  # 拼接START_TAG
-        for i in range(feats.size()[1]):
-            feat = feats[:, i, :]  # [batch, tag_size]
+        tags = torch.cat((var, tags), dim=0)  # 拼接START_TAG
+        for i, feat in enumerate(feats):  # [batch, tag_size]
             score = score + \
-                self.transitions[tags[:, i + 1], tags[:, i]] + feat[:, tags[:, i + 1]]
-        score = score + self.transitions[self.tag_to_ix[STOP_TAG], tags[:, -1]]
+                    (self.transitions[tags[i + 1, :], tags[i, :]] + feat[range(batch), tags[i + 1]]) * mask[i]
+        terminal_var = torch.stack([self.transitions[tag_to_ix[STOP_TAG], tag[mask[:, b].sum().long()]] for b, tag in
+                                    enumerate(tags.transpose(0, 1))])
+        score = score + terminal_var
         return score  # [batch]
 
-    def _viterbi_decode(self, feats):
-        # feats: [batch, seq_len, tag_size]
-        batch, seq_len, tag_size = feats.size()
+    def _viterbi_decode(self, feats, mask):
+        # feats: [seq_len, batch, tag_size]
+        # mask: [seq_len, batch]
+        seq_len, batch, tag_size = feats.size()
         pointers = []
 
         # Initialize the viterbi variables in log space
@@ -141,16 +148,19 @@ class BiLSTM_CRF(nn.Module):
         scores[:, self.tag_to_ix[START_TAG]] = 0
 
         # scores at step i holds the viterbi variables for step i-1
-        convert_feats = feats.permute(1, 0, 2)
-        for feat in convert_feats:
+        for t, feat in enumerate(feats):
             # feat: [batch, tag_size]
             # [batch, next_tag, current_tag]
-            scores = scores.unsqueeze(1) + self.transitions # [batch, tag_size, tag_size]
+            scores_t = scores.unsqueeze(1) + self.transitions # [batch, tag_size, tag_size]
             # max along current_tag to obtain: next_tag score, current_tag pointer
-            scores, pointer = torch.max(scores, -1)
-            scores = scores + feat  # [batch, tag_size]
+            scores_t, pointer = torch.max(scores_t, -1)
+            scores_t = scores_t + feat  # [batch, tag_size]
             pointers.append(pointer)
-        pointers = torch.stack(pointers, 0).permute(1, 0, 2)  # [batch, seq_len, tag_size]
+
+            mask_t = mask[t].unsqueeze(-1)
+            scores = scores_t * mask_t + scores * (1 - mask_t)
+
+        pointers = torch.stack(pointers, 0)  # [batch, seq_len, tag_size]
         scores = scores + self.transitions[self.tag_to_ix[STOP_TAG]]
         best_score, best_tag = torch.max(scores, -1)  # [batch]
 
@@ -158,7 +168,8 @@ class BiLSTM_CRF(nn.Module):
         best_path = best_tag.unsqueeze(-1).tolist()
         for i in range(batch):
             best_tag_i = best_tag[i]
-            for ptr_t in reversed(pointers[i]):
+            seq_len_i = int(mask[:, i].sum())
+            for ptr_t in reversed(pointers[:seq_len_i, i]):
                 best_tag_i = ptr_t[best_tag_i].item()
                 best_path[i].append(best_tag_i)
             # Pop off the start tag (we dont want to return that to the caller)
@@ -167,20 +178,26 @@ class BiLSTM_CRF(nn.Module):
             best_path[i].reverse()
         return best_path
 
-    def neg_log_likelihood(self, sentence, tags):
+    def neg_log_likelihood(self, sentence, tags, mask):
         # 损失函数
-        batch = sentence.size()[0]
-        feats = self._get_lstm_features(sentence)  # BiLSTM+Linear层的输出
-        forward_score = self._forward_alg(feats)
-        gold_score = self._score_sentence(feats, tags)
+        # sentence: [seq_len, batch]
+        # tags: [seq_len, batch]
+        # mask: [seq_len, batch]
+        batch = sentence.size()[1]
+        feats = self._get_lstm_features(sentence, mask)  # BiLSTM+Linear层的输出
+        forward_score = self._forward_alg(feats, mask)
+        gold_score = self._score_sentence(feats, tags, mask)
         return torch.sum(forward_score - gold_score) / batch
 
-    def forward(self, sentence):  # dont confuse this with _forward_alg above.
+    def forward(self, sentence, mask):  # dont confuse this with _forward_alg above.
+        # sentence: [seq_len, batch]
+        # mask: [seq_len, batch]
+
         # Get the emission scores from the BiLSTM
-        lstm_feats = self._get_lstm_features(sentence)
+        lstm_feats = self._get_lstm_features(sentence, mask)
 
         # Find the best path, given the features.
-        tag_seq_list = self._viterbi_decode(lstm_feats)
+        tag_seq_list = self._viterbi_decode(lstm_feats, mask)
         return tag_seq_list
 
 
@@ -201,13 +218,16 @@ def train():
     )
 
     model = BiLSTM_CRF(len(word_to_ix), tag_to_ix, EMBEDDING_DIM, HIDDEN_DIM).cuda()
+    # model = torch.load("model/bilstm_crf.pkl").cuda()
     optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
+    '''
     with torch.no_grad():
         precheck_sent = prepare_sequence(training_data[1][0], word_to_ix).view(1, -1).cuda()
         precheck_tags = torch.tensor([tag_to_ix[t] for t in training_data[1][1]], dtype=torch.long)
         print(precheck_tags)
         print(model(precheck_sent))
+    '''
 
     steps = len(word_set) // BATCH_SIZE
     for epoch in range(num_epochs):
@@ -215,8 +235,17 @@ def train():
             model.zero_grad()
 
             sentence, tags = batch
+            sentence = sentence.transpose(0, 1)  # [seq_len, batch]
+            tags = tags.transpose(0, 1)
 
-            loss = model.neg_log_likelihood(sentence.clone().detach().cuda(), tags.clone().detach().cuda())
+            mask = torch.ne(sentence, torch.tensor(tag_to_ix[PAD_TAG])).float().cuda()  # [seq_len, batch]
+            length = mask.sum(0)
+            _, idx = length.sort(0, descending=True)
+            sentence = sentence[:, idx]
+            tags = tags[:, idx]
+            mask = mask[:, idx]
+
+            loss = model.neg_log_likelihood(sentence.clone().detach().cuda(), tags.clone().detach().cuda(), mask)
 
             loss.backward()
             optimizer.step()
@@ -225,9 +254,11 @@ def train():
 
     torch.save(model, "model/bilstm_crf.pkl")
 
+    '''
     with torch.no_grad():
         precheck_sent = prepare_sequence(training_data[1][0], word_to_ix).view(1, -1).cuda()
         print(model(precheck_sent))
+    '''
 
 
 def tag_convert(tag):		# For evaluation using conlleval.perl, which doesn't support the following.
@@ -259,8 +290,21 @@ def test():
     predict = []
     for batch in test_loader:
         sentence, tags = batch
-        ans = model(sentence.clone().detach().cuda())  # [[], [], ...]
+        sentence = sentence.transpose(0, 1)  # [seq_len, batch]
+        tags = tags.transpose(0, 1)
+
+        mask = torch.ne(sentence, torch.tensor(tag_to_ix[PAD_TAG])).float().cuda()  # [seq_len, batch]
+        length = mask.sum(0)
+        _, idx = length.sort(0, descending=True)
+        sentence = sentence[:, idx]
+        tags = tags[:, idx]
+        mask = mask[:, idx]
+
+        ans = model(sentence.clone().detach().cuda(), mask)  # [[], [], ...]
+
         # TODO: batch evaluate
+        sentence = sentence.transpose(0, 1)  # [batch, seq_len]
+        tags = tags.transpose(0, 1)
         for i in range(len(sentence)):
             predict.append((sentence[i], tags[i], ans[i]))  # Each tuple is a sentence, its tags and its answers.
 
@@ -283,8 +327,8 @@ if __name__ == '__main__':
     EMBEDDING_DIM = 50
     HIDDEN_DIM = 100
     BATCH_SIZE = 32
-    max_seq_len = 100
-    num_epochs = 1
+    max_seq_len = 150
+    num_epochs = 15
 
     training_data = preprocess("../data/conll.train")
     test_data = preprocess("../data/conll.test")
