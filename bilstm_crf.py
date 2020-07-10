@@ -70,6 +70,8 @@ class BiLSTM_CRF(nn.Module):
         # to the start tag and we never transfer from the stop tag
         self.transitions.data[tag_to_ix[START_TAG], :] = -10000
         self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
+        self.transitions.data[tag_to_ix[PAD_TAG], :] = -10000
+        self.transitions.data[:, tag_to_ix[PAD_TAG]] = -10000
 
         self.reset_parameters()
 
@@ -221,18 +223,29 @@ def train():
 
             print("epoch", epoch, ":", step, "/", steps, "loss:", loss.item())
 
-    torch.save(model, "model/bilstm_crf.pkl")
+    # torch.save(model, "model/bilstm_crf.pkl")
 
     with torch.no_grad():
         precheck_sent = prepare_sequence(training_data[1][0], word_to_ix).view(1, -1).cuda()
         print(model(precheck_sent))
+    return model
 
 
-def test():
+def tag_convert(tag):		# For evaluation using conlleval.perl, which doesn't support the following.
+    if tag == "OUT" or tag == "<PAD>":
+        return "O"
+    else:
+        return tag
+
+
+def test(model):
     word_set = []
     tag_set = []
     for sentence, tags in test_data:
-        word_set.append([word_to_ix[word] for word in sentence])
+        sequence = []
+        for word in sentence:
+            sequence.append(word_to_ix[word])
+        word_set.append(sequence)
         tag_set.append([tag_to_ix[tag] for tag in tags])
 
     print("test_size:", len(word_set))
@@ -243,12 +256,26 @@ def test():
         batch_size=BATCH_SIZE
     )
 
-    model = torch.load("model/bilstm_crf.pkl").cuda()
+    # model = torch.load("bilstm_crf_32_15.pkl").cuda()
+    predict = []
     for batch in test_loader:
         sentence, tags = batch
         ans = model(sentence.clone().detach().cuda())  # [[], [], ...]
         # TODO: batch evaluate
+        for i in range(len(sentence)):
+            predict.append((sentence[i], tags[i], ans[i]))  # Each tuple is a sentence, its tags and its answers.
 
+    with open("../results.txt", "w") as f:
+        for sentence, tags, ans in predict:
+            for i in range(max_seq_len):
+                if sentence[i] == ix_to_word[PAD_TAG]:
+                    break
+                else:
+                    f.write(ix_to_word[sentence[i].item()] + ' ' \
+                            + tag_convert(ix_to_tag[tags[i].item()]) + ' ' \
+                            + tag_convert(ix_to_tag[ans[i]]) + '\n')
+                    # Note that sentence and tags are tensors, but ans are not tensors.
+            f.write('\n')
 
 if __name__ == '__main__':
     START_TAG = "<START>"
@@ -258,26 +285,31 @@ if __name__ == '__main__':
     HIDDEN_DIM = 100
     BATCH_SIZE = 32
     max_seq_len = 100
-    num_epochs = 15
+    num_epochs = 1
 
-    training_data = preprocess("data/conll.train")
-    test_data = preprocess("data/conll.test")
+    training_data = preprocess("../data/conll.train")
+    test_data = preprocess("../data/conll.test")
 
     word_to_ix = {PAD_TAG: 0}
+    ix_to_word = {0: PAD_TAG}
     tag_to_ix = {START_TAG: 0, STOP_TAG: 1, PAD_TAG: 2}
+    ix_to_tag = {0: START_TAG, 1: STOP_TAG, 2: PAD_TAG}
     for sentence, tags in training_data:
         for word in sentence:
             if word not in word_to_ix:
                 word_to_ix[word] = len(word_to_ix)
+                ix_to_word[len(ix_to_word)] = word
         for tag in tags:
             if tag not in tag_to_ix:
                 tag_to_ix[tag] = len(tag_to_ix)
+                ix_to_tag[len(ix_to_tag)] = tag
     for sentence, _ in test_data:
         for word in sentence:
             if word not in word_to_ix:
                 word_to_ix[word] = len(word_to_ix)
+                ix_to_word[len(ix_to_word)] = word
 
     print(tag_to_ix)
 
-    train()
-    # test()
+    model = train()
+    test(model)
