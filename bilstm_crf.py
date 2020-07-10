@@ -32,7 +32,7 @@ def preprocess(file_path):
                     tag = []
                 continue
             pair = line.split('\t')
-            word.append(pair[0])
+            word.append(pair[0].lower())        # Temporal measure
             tag.append(pair[1])
 
     if len(word) > 0:
@@ -67,8 +67,6 @@ def get_embeddings(word_embeddings_path, embedding_size):
             word2idx[split[0]] = len(word2idx)
             idx2word[len(word2idx) - 1] = split[0]
 
-    word_embeddings = np.array(word_embeddings, dtype='float32')
-
     return word_embeddings, word2idx, idx2word
 
 
@@ -93,7 +91,9 @@ class BiLSTM_CRF(nn.Module):
         self.tag_to_ix = tag_to_ix
         self.tagset_size = len(tag_to_ix)
 
-        self.word_embeds = nn.Embedding.from_pretrained(torch.Tensor(word_embeddings), freeze=True)
+        self.word_embeds = nn.Embedding.from_pretrained(torch.Tensor(word_embeddings), freeze=False)
+
+        self.dropout = nn.Dropout(dropout_rate)
 
         self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2,
                             num_layers=1, bidirectional=True, batch_first=True)  # input: [batch, seq_len, embed_dim]
@@ -110,8 +110,6 @@ class BiLSTM_CRF(nn.Module):
         # to the start tag and we never transfer from the stop tag
         self.transitions.data[tag_to_ix[START_TAG], :] = -10000
         self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
-        self.transitions.data[tag_to_ix[PAD_TAG], :] = -10000
-        self.transitions.data[:, tag_to_ix[PAD_TAG]] = -10000
 
         self.reset_parameters()
 
@@ -151,6 +149,9 @@ class BiLSTM_CRF(nn.Module):
         # sentence: [batch, seq_len]
         hidden = self.init_hidden(batch=sentence.size()[0])
         embeds = self.word_embeds(sentence)  # [batch, seq_len, embed_dim]
+        if dropout_rate > 0:
+            embeds = self.dropout(embeds)
+
         lstm_out, hidden = self.lstm(embeds, hidden)  # lstm_out: [batch, seq_len, hidden_dim]
         lstm_feats = self.hidden2tag(lstm_out)
         return lstm_feats  # [batch, seq_len, tag_size]
@@ -167,7 +168,7 @@ class BiLSTM_CRF(nn.Module):
         for i in range(feats.size()[1]):
             feat = feats[:, i, :]  # [batch, tag_size]
             score = score + \
-                    self.transitions[tags[:, i + 1], tags[:, i]] + feat[:, tags[:, i + 1]]
+                    self.transitions[tags[:, i + 1], tags[:, i]] + feat[range(batch), tags[:, i + 1]]
         score = score + self.transitions[self.tag_to_ix[STOP_TAG], tags[:, -1]]
         return score  # [batch]
 
@@ -247,6 +248,7 @@ def train():
     )
 
     model = BiLSTM_CRF(len(word_to_ix), tag_to_ix, EMBEDDING_DIM, HIDDEN_DIM).cuda()
+    # model = torch.load("model/bilstm_crf.pkl").cuda()
     optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
     with torch.no_grad():
@@ -305,11 +307,11 @@ def test():
     )
 
     model = torch.load("model/bilstm_crf.pkl").cuda()
+    # model.eval()
     predict = []
     for batch in test_loader:
         sentence, tags = batch
         ans = model(sentence.clone().detach().cuda())  # [[], [], ...]
-        # TODO: batch evaluate
         for i in range(len(sentence)):
             predict.append((sentence[i], tags[i], ans[i]))  # Each tuple is a sentence, its tags and its answers.
 
@@ -335,22 +337,30 @@ if __name__ == '__main__':
     HIDDEN_DIM = 100
     BATCH_SIZE = 32
     max_seq_len = 100
-    num_epochs = 1
-    word_embeddings_path = '../data/glove.6B.50d.txt'
+    num_epochs = 100
+    word_embeddings_path = "../data/glove.6B.50d.txt"
     embedding_size = 50
+    dropout_rate = 0
 
     training_data = preprocess("../data/conll.train")
     test_data = preprocess("../data/conll.test")
 
-    tag_to_ix = {START_TAG: 0, STOP_TAG: 1, PAD_TAG: 2}
-    ix_to_tag = {0: START_TAG, 1: STOP_TAG, 2: PAD_TAG}
-    for sentence, tags in training_data:
+    word_embeddings, word_to_ix, ix_to_word = get_embeddings(word_embeddings_path, embedding_size)
+
+    tag_to_ix = {PAD_TAG: 0, START_TAG: 1, STOP_TAG: 2}
+    ix_to_tag = {0: PAD_TAG, 1: START_TAG, 2: STOP_TAG}
+    for sentence, tags in training_data + test_data:
         for tag in tags:
             if tag not in tag_to_ix:
                 tag_to_ix[tag] = len(tag_to_ix)
                 ix_to_tag[len(ix_to_tag)] = tag
-
-    word_embeddings, word_to_ix, ix_to_word = get_embeddings(word_embeddings_path, embedding_size)
+        for word in sentence:
+            if word.isdigit():
+                word = "0"
+            if word not in word_to_ix:
+                word_to_ix[word] = len(word_to_ix)  # roughly 3% of the training set
+                ix_to_word[len(ix_to_word)] = word
+                word_embeddings.append(np.random.uniform(-0.25, 0.25, embedding_size))
 
     print(tag_to_ix)
     print(ix_to_tag)
