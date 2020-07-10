@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as Data
 import numpy as np
+import io
 
 torch.manual_seed(1)
 # 默认torch.cuda.is_available() == True
@@ -41,8 +42,41 @@ def preprocess(file_path):
     return data  # [([word], [tag]), ...]
 
 
+def get_embeddings(word_embeddings_path, embedding_size):
+    word2idx = {}
+    idx2word = {}
+    word_embeddings = []
+
+    word2idx[PAD_TAG] = len(word2idx)
+    idx2word[0] = PAD_TAG
+    word_embeddings.append(np.zeros(embedding_size))
+
+    word2idx[UNKNOWN] = len(word2idx)  # roughly 3% of the training set
+    idx2word[1] = UNKNOWN
+    word_embeddings.append(np.random.uniform(-0.25, 0.25, embedding_size))
+
+    with io.open(word_embeddings_path, 'r', encoding="utf-8") as f_em:
+        for line in f_em:
+            split = line.strip().split(" ")
+            if len(split) <= 2:
+                continue
+            if len(split) - 1 != embedding_size:
+                continue
+            word_embeddings.append(np.asarray(split[1:], dtype='float32'))
+            word2idx[split[0]] = len(word2idx)
+            idx2word[len(word2idx) - 1] = split[0]
+
+    return word_embeddings, word2idx, idx2word
+
+
 def prepare_sequence(seq, to_ix):
-    idxs = [to_ix[w] for w in seq]
+    # idxs = [to_ix[w] for w in seq]
+    idxs = []
+    for w in seq:
+        try:
+            idxs.append(to_ix[w])
+        except:
+            idxs.append(to_ix[UNKNOWN])
     return torch.tensor(idxs, dtype=torch.long)
 
 
@@ -56,7 +90,8 @@ class BiLSTM_CRF(nn.Module):
         self.tag_to_ix = tag_to_ix
         self.tagset_size = len(tag_to_ix)
 
-        self.word_embeds = nn.Embedding(vocab_size, embedding_dim, padding_idx=word_to_ix[PAD_TAG])
+        self.word_embeds = nn.Embedding.from_pretrained(torch.Tensor(word_embeddings), freeze=False)
+        self.dropout = nn.Dropout(dropout_rate)
         self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2,
                             num_layers=1, bidirectional=True)  # input: [seq_len, batch, embed_dim]
 
@@ -65,8 +100,7 @@ class BiLSTM_CRF(nn.Module):
 
         # Matrix of transition parameters.  Entry i,j is the score of
         # transitioning *to* i *from* j.
-        self.transitions = nn.Parameter(
-            torch.randn(self.tagset_size, self.tagset_size))
+        self.transitions = nn.Parameter(torch.randn(self.tagset_size, self.tagset_size))
 
         # These two statements enforce the constraint that we never transfer
         # to the start tag and we never transfer from the stop tag
@@ -76,7 +110,7 @@ class BiLSTM_CRF(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.xavier_normal_(self.word_embeds.weight)
+        # nn.init.xavier_normal_(self.word_embeds.weight)
         nn.init.xavier_normal_(self.hidden2tag.weight)
 
     def init_hidden(self, batch=1):
@@ -153,7 +187,7 @@ class BiLSTM_CRF(nn.Module):
         for t, feat in enumerate(feats):
             # feat: [batch, tag_size]
             # [batch, next_tag, current_tag]
-            scores_t = scores.unsqueeze(1) + self.transitions # [batch, tag_size, tag_size]
+            scores_t = scores.unsqueeze(1) + self.transitions  # [batch, tag_size, tag_size]
             # max along current_tag to obtain: next_tag score, current_tag pointer
             scores_t, pointer = torch.max(scores_t, -1)
             scores_t = scores_t + feat  # [batch, tag_size]
@@ -207,7 +241,13 @@ def train():
     word_set = []
     tag_set = []
     for sentence, tags in training_data:
-        word_set.append([word_to_ix[word] for word in sentence])
+        sequence = []
+        for word in sentence:
+            try:
+                sequence.append(word_to_ix[word])
+            except:
+                sequence.append(word_to_ix[UNKNOWN])
+        word_set.append(sequence)
         tag_set.append([tag_to_ix[tag] for tag in tags])
 
     print("train_size:", len(word_set))
@@ -265,7 +305,7 @@ def train():
     '''
 
 
-def tag_convert(tag):		# For evaluation using conlleval.perl, which doesn't support the following.
+def tag_convert(tag):  # For evaluation using conlleval.perl, which doesn't support the following.
     if tag == "OUT" or tag == START_TAG or tag == STOP_TAG or tag == PAD_TAG:
         return "O"
     else:
@@ -326,37 +366,38 @@ def test():
                     # Note that sentence and tags are tensors, but ans are not tensors.
             f.write('\n')
 
+
 if __name__ == '__main__':
     START_TAG = "<START>"
     STOP_TAG = "<STOP>"
     PAD_TAG = "<PAD>"
+    UNKNOWN = "<UNKNOWN>"
     EMBEDDING_DIM = 50
     HIDDEN_DIM = 100
     BATCH_SIZE = 32
     max_seq_len = 150
     num_epochs = 100
+    word_embeddings_path = "../data/glove.6B.50d.txt"
+    embedding_size = 50
+    dropout_rate = 0
 
     training_data = preprocess("../data/conll.train")
     test_data = preprocess("../data/conll.test")
 
-    word_to_ix = {PAD_TAG: 0}
-    ix_to_word = {0: PAD_TAG}
+    word_embeddings, word_to_ix, ix_to_word = get_embeddings(word_embeddings_path, embedding_size)
+
     tag_to_ix = {PAD_TAG: 0, START_TAG: 1, STOP_TAG: 2}
     ix_to_tag = {0: PAD_TAG, 1: START_TAG, 2: STOP_TAG}
-    for sentence, tags in training_data:
-        for word in sentence:
-            if word not in word_to_ix:
-                word_to_ix[word] = len(word_to_ix)
-                ix_to_word[len(ix_to_word)] = word
+    for sentence, tags in training_data + test_data:
         for tag in tags:
             if tag not in tag_to_ix:
                 tag_to_ix[tag] = len(tag_to_ix)
                 ix_to_tag[len(ix_to_tag)] = tag
-    for sentence, _ in test_data:
         for word in sentence:
             if word not in word_to_ix:
-                word_to_ix[word] = len(word_to_ix)
+                word_to_ix[word] = len(word_to_ix)  # roughly 3% of the training set
                 ix_to_word[len(ix_to_word)] = word
+                word_embeddings.append(np.random.uniform(-0.25, 0.25, embedding_size))
 
     print(tag_to_ix)
     print(ix_to_tag)
