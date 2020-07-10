@@ -28,7 +28,9 @@ def preprocess(file_path):
                     tag = []
                 continue
             pair = line.split('\t')
-            word.append(pair[0])
+            if pair[0].isdigit():
+                pair[0] = "0"  # 将数字全改成“0”
+            word.append(pair[0].lower())  # 大写字母均改成小写
             tag.append(pair[1])
 
     if len(word) > 0:
