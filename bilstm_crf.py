@@ -397,10 +397,10 @@ if __name__ == '__main__':
     STOP_TAG = "<STOP>"
     PAD = "<PAD>"
     UNK = "<UNK>"
-    EMBEDDING_DIM = 50
+    EMBEDDING_DIM = 100
     HIDDEN_DIM = 100
-    CHAR_EMBEDDING_DIM = 50
-    CHAR_HIDDEN_DIM = 30
+    CHAR_EMBEDDING_DIM = 100
+    CHAR_HIDDEN_DIM = 50
     DROPOUT = 0.5
     BATCH_SIZE = 32
     NUM_EPOCHS = 50
@@ -408,8 +408,8 @@ if __name__ == '__main__':
     max_seq_len = 50
     max_word_len = 25
 
-    word_embeddings_path = "../data/glove.6B.50d.txt"
-    embedding_size = 50
+    word_embeddings_path = "../data/glove.6B.100d.txt"
+    embedding_size = 100
     
     char_to_ix = {PAD: 0}
 
