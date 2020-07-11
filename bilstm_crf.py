@@ -19,28 +19,43 @@ def preprocess(file_path):
     data = []
     word = []
     tag = []
+    char_seq = []  # 每个句子的每个词的字符表示
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
 
             if len(line) == 0 or len(word) >= max_seq_len:
                 if len(word) > 0:
-                    word = word + [PAD_TAG] * (max_seq_len - len(word))
-                    tag = tag + [PAD_TAG] * (max_seq_len - len(tag))
-                    data.append((word, tag))
+                    word = word + [PAD] * (max_seq_len - len(word))
+                    tag = tag + [PAD] * (max_seq_len - len(tag))
+                    char_seq = char_seq + [[char_to_ix[PAD]] * max_word_len] * (max_seq_len - len(char_seq))
+                    data.append((word, tag, char_seq))
                     word = []
                     tag = []
+                    char_seq = []
                 continue
             pair = line.split('\t')
-            word.append(pair[0].lower())        # Temporal measure
+
+            # prepare char dictionary
+            w = pair[0]
+            char = []  # character index representations
+            for c in w:
+                if c not in char_to_ix:
+                    char_to_ix[c] = len(char_to_ix)
+                char.append(char_to_ix[c])
+            char = char + [char_to_ix[PAD]] * (max_word_len - len(char))
+            char_seq.append(char)
+
+            word.append(w.lower())
             tag.append(pair[1])
 
     if len(word) > 0:
-        word = word + [PAD_TAG] * (max_seq_len - len(word))
-        tag = tag + [PAD_TAG] * (max_seq_len - len(tag))
-        data.append((word, tag))
+        word = word + [PAD] * (max_seq_len - len(word))
+        tag = tag + [PAD] * (max_seq_len - len(tag))
+        char_seq = char_seq + [[char_to_ix[PAD]] * max_word_len] * (max_seq_len - len(char_seq))
+        data.append((word, tag, char_seq))
 
-    return data  # [([word], [tag]), ...]
+    return data  # [([word], [tag], [char]), ...]
 
 
 def get_embeddings(word_embeddings_path, embedding_size):
@@ -48,12 +63,12 @@ def get_embeddings(word_embeddings_path, embedding_size):
     idx2word = {}
     word_embeddings = []
 
-    word2idx[PAD_TAG] = len(word2idx)
-    idx2word[0] = PAD_TAG
+    word2idx[PAD] = len(word2idx)
+    idx2word[0] = PAD
     word_embeddings.append(np.zeros(embedding_size))
 
-    word2idx[UNKNOWN] = len(word2idx)  # roughly 3% of the training set
-    idx2word[1] = UNKNOWN
+    word2idx[UNK] = len(word2idx)  # roughly 3% of the training set
+    idx2word[1] = UNK
     word_embeddings.append(np.random.uniform(-0.25, 0.25, embedding_size))
 
     with io.open(word_embeddings_path, 'r', encoding="utf-8") as f_em:
@@ -77,25 +92,69 @@ def prepare_sequence(seq, to_ix):
         try:
             idxs.append(to_ix[w])
         except:
-            idxs.append(to_ix[UNKNOWN])
+            idxs.append(to_ix[UNK])
     return torch.tensor(idxs, dtype=torch.long)
+
+
+class char_Embedding(nn.Module):
+
+    def __init__(self, embed_dim, hidden_dim):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+
+        self.embedding = nn.Embedding(len(char_to_ix), embed_dim, padding_idx=char_to_ix[PAD])
+        self.bilstm = nn.LSTM(embed_dim, hidden_dim // 2,
+                              num_layers=1, bidirectional=True)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_normal_(self.embedding.weight)
+
+    def forward(self, input):
+        # input: [word_len, batch * seq_len]
+        word_len, bs = input.size()
+        # 求mask，按词的长度降序排序
+        mask = torch.ne(input, torch.tensor(char_to_ix[PAD]).cuda()).float()  # [word_len, batch * seq_len]
+        length = mask.sum(0).long()
+        max_length, _ = torch.max(length, 0)
+        max_length = max_length.item()
+
+        _, sort_idx = length.sort(0, descending=True)
+        _, unsort_idx = sort_idx.sort(0)
+        x = input[:max_length, sort_idx]
+        mask = mask[:max_length, sort_idx]
+
+        length = mask.sum(0).long()
+        index = torch.gt(length, torch.tensor(0).cuda()).long().sum(0).item()
+        x = x[:, :index]
+        mask = mask[:, :index]
+
+        x = self.embedding(x)  # [word_len, index, embed_dim]
+        x = nn.utils.rnn.pack_padded_sequence(x, mask.sum(0).long())
+        x, (h, c) = self.bilstm(x)  # h: [num_layers * num_directions, index, hidden_dim]
+        h = torch.cat((h[0], h[1]), -1)  # [index, hidden_dim]
+        h = torch.cat((h, torch.zeros(bs - index, self.hidden_dim).cuda()), 0)
+        h = h[unsort_idx, :]
+        return h  # [batch * seq_len, hidden_dim]
 
 
 class BiLSTM_CRF(nn.Module):
 
-    def __init__(self, vocab_size, tag_to_ix, embedding_dim, hidden_dim):
+    def __init__(self, vocab_size, tag_to_ix, embedding_dim, hidden_dim, dropout):
         super().__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
         self.tag_to_ix = tag_to_ix
         self.tagset_size = len(tag_to_ix)
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
 
+        self.char_embeds = char_Embedding(CHAR_EMBEDDING_DIM, CHAR_HIDDEN_DIM)
         self.word_embeds = nn.Embedding.from_pretrained(torch.Tensor(word_embeddings), freeze=False)
 
-        self.dropout = nn.Dropout(dropout_rate)
+        self.dropout = nn.Dropout(dropout)
 
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2,
+        self.lstm = nn.LSTM(embedding_dim + CHAR_HIDDEN_DIM, hidden_dim // 2,
                             num_layers=1, bidirectional=True, batch_first=True)  # input: [batch, seq_len, embed_dim]
 
         # Maps the output of the LSTM into tag space.
@@ -145,12 +204,19 @@ class BiLSTM_CRF(nn.Module):
         alpha = alpha + self.transitions[self.tag_to_ix[STOP_TAG]]
         return torch.logsumexp(alpha, dim=-1)  # [batch]
 
-    def _get_lstm_features(self, sentence):
+    def _get_lstm_features(self, sentence, char):
         # sentence: [batch, seq_len]
+        # char: [batch, seq_len, word_len]
         hidden = self.init_hidden(batch=sentence.size()[0])
-        embeds = self.word_embeds(sentence)  # [batch, seq_len, embed_dim]
-        if dropout_rate > 0:
-            embeds = self.dropout(embeds)
+
+        batch, seq_len, word_len = char.size()
+        char_t = char.view(-1, word_len).transpose(0, 1)  # [word_len, batch * seq_len]
+        char_embed = self.char_embeds(char_t)  # [batch * seq_len, embed_dim]
+        char_embed = char_embed.view(batch, seq_len, -1)  # [batch, seq_len, embed_dim]
+        word_embed = self.word_embeds(sentence)  # [batch, seq_len, embed_dim]
+        embeds = torch.cat((char_embed, word_embed), dim=-1)
+
+        # embeds = self.dropout(embeds)
 
         lstm_out, hidden = self.lstm(embeds, hidden)  # lstm_out: [batch, seq_len, hidden_dim]
         lstm_feats = self.hidden2tag(lstm_out)
@@ -208,17 +274,17 @@ class BiLSTM_CRF(nn.Module):
             best_path[i].reverse()
         return best_path
 
-    def neg_log_likelihood(self, sentence, tags):
+    def neg_log_likelihood(self, sentence, tags, char):
         # 损失函数
         batch = sentence.size()[0]
-        feats = self._get_lstm_features(sentence)  # BiLSTM+Linear层的输出
+        feats = self._get_lstm_features(sentence, char)  # BiLSTM+Linear层的输出
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
         return torch.sum(forward_score - gold_score) / batch
 
-    def forward(self, sentence):  # dont confuse this with _forward_alg above.
+    def forward(self, sentence, char):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
-        lstm_feats = self._get_lstm_features(sentence)
+        lstm_feats = self._get_lstm_features(sentence, char)
 
         # Find the best path, given the features.
         tag_seq_list = self._viterbi_decode(lstm_feats)
@@ -228,43 +294,42 @@ class BiLSTM_CRF(nn.Module):
 def train():
     word_set = []
     tag_set = []
-    for sentence, tags in training_data:
+    char_set = []
+    for sentence, tags, char_seq in training_data:
         sequence = []
         for word in sentence:
             try:
                 sequence.append(word_to_ix[word])
             except:
-                sequence.append(word_to_ix[UNKNOWN])
+                sequence.append(word_to_ix[UNK])
         word_set.append(sequence)
         tag_set.append([tag_to_ix[tag] for tag in tags])
+        char_set.append(char_seq)
 
     print("train_size:", len(word_set))
+    print("char_size:", len(char_set))
 
-    train_set = Data.TensorDataset(torch.tensor(word_set, dtype=torch.long), torch.tensor(tag_set, dtype=torch.long))
+    train_set = Data.TensorDataset(torch.tensor(word_set, dtype=torch.long), torch.tensor(tag_set, dtype=torch.long),
+                                   torch.tensor(char_set, dtype=torch.long))
     train_loader = Data.DataLoader(
         dataset=train_set,
         batch_size=BATCH_SIZE,
         shuffle=True
     )
 
-    model = BiLSTM_CRF(len(word_to_ix), tag_to_ix, EMBEDDING_DIM, HIDDEN_DIM).cuda()
+    model = BiLSTM_CRF(len(word_to_ix), tag_to_ix, EMBEDDING_DIM, HIDDEN_DIM, DROPOUT).cuda()
     # model = torch.load("model/bilstm_crf.pkl").cuda()
     optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
-    with torch.no_grad():
-        precheck_sent = prepare_sequence(training_data[1][0], word_to_ix).view(1, -1).cuda()
-        precheck_tags = torch.tensor([tag_to_ix[t] for t in training_data[1][1]], dtype=torch.long)
-        print(precheck_tags)
-        print(model(precheck_sent))
-
     steps = len(word_set) // BATCH_SIZE
-    for epoch in range(num_epochs):
+    for epoch in range(NUM_EPOCHS):
         for step, batch in enumerate(train_loader):
             model.zero_grad()
 
-            sentence, tags = batch
+            sentence, tags, char_seq = batch  # char_seq: [batch, seq_len, word_len]
 
-            loss = model.neg_log_likelihood(sentence.clone().detach().cuda(), tags.clone().detach().cuda())
+            loss = model.neg_log_likelihood(sentence.cuda(), tags.cuda(),
+                                            char_seq.cuda())
 
             loss.backward()
             optimizer.step()
@@ -273,13 +338,9 @@ def train():
 
     torch.save(model, "model/bilstm_crf.pkl")
 
-    with torch.no_grad():
-        precheck_sent = prepare_sequence(training_data[1][0], word_to_ix).view(1, -1).cuda()
-        print(model(precheck_sent))
-
 
 def tag_convert(tag):  # For evaluation using conlleval.perl, which doesn't support the following.
-    if tag == "OUT" or tag == START_TAG or tag == STOP_TAG or tag == PAD_TAG:
+    if tag == "OUT" or tag == START_TAG or tag == STOP_TAG or tag == PAD:
         return "O"
     else:
         return tag
@@ -288,19 +349,22 @@ def tag_convert(tag):  # For evaluation using conlleval.perl, which doesn't supp
 def test():
     word_set = []
     tag_set = []
-    for sentence, tags in test_data:
+    char_set = []
+    for sentence, tags, char_seq in test_data:
         sequence = []
         for word in sentence:
             try:
                 sequence.append(word_to_ix[word])
             except:
-                sequence.append(word_to_ix[UNKNOWN])
+                sequence.append(word_to_ix[UNK])
         word_set.append(sequence)
         tag_set.append([tag_to_ix[tag] for tag in tags])
+        char_set.append(char_seq)
 
     print("test_size:", len(word_set))
 
-    test_set = Data.TensorDataset(torch.tensor(word_set, dtype=torch.long), torch.tensor(tag_set, dtype=torch.long))
+    test_set = Data.TensorDataset(torch.tensor(word_set, dtype=torch.long), torch.tensor(tag_set, dtype=torch.long),
+                                  torch.tensor(char_set, dtype=torch.long))
     test_loader = Data.DataLoader(
         dataset=test_set,
         batch_size=BATCH_SIZE
@@ -310,15 +374,15 @@ def test():
     # model.eval()
     predict = []
     for batch in test_loader:
-        sentence, tags = batch
-        ans = model(sentence.clone().detach().cuda())  # [[], [], ...]
+        sentence, tags, char_seq = batch
+        ans = model(sentence.cuda(), char_seq.cuda())  # [[], [], ...]
         for i in range(len(sentence)):
             predict.append((sentence[i], tags[i], ans[i]))  # Each tuple is a sentence, its tags and its answers.
 
     with open("results.txt", "w") as f:
         for sentence, tags, ans in predict:
             for i in range(max_seq_len):
-                if sentence[i] == word_to_ix[PAD_TAG]:
+                if sentence[i] == word_to_ix[PAD]:
                     break
                 else:
                     f.write(ix_to_word[sentence[i].item()] + ' ' \
@@ -331,25 +395,32 @@ def test():
 if __name__ == '__main__':
     START_TAG = "<START>"
     STOP_TAG = "<STOP>"
-    PAD_TAG = "<PAD>"
-    UNKNOWN = "<UNKNOWN>"
+    PAD = "<PAD>"
+    UNK = "<UNK>"
     EMBEDDING_DIM = 50
     HIDDEN_DIM = 100
+    CHAR_EMBEDDING_DIM = 50
+    CHAR_HIDDEN_DIM = 30
+    DROPOUT = 0.5
     BATCH_SIZE = 32
-    max_seq_len = 100
-    num_epochs = 100
+    NUM_EPOCHS = 50
+
+    max_seq_len = 50
+    max_word_len = 25
+
     word_embeddings_path = "../data/glove.6B.50d.txt"
     embedding_size = 50
-    dropout_rate = 0
+    
+    char_to_ix = {PAD: 0}
 
     training_data = preprocess("../data/conll.train")
     test_data = preprocess("../data/conll.test")
 
     word_embeddings, word_to_ix, ix_to_word = get_embeddings(word_embeddings_path, embedding_size)
 
-    tag_to_ix = {PAD_TAG: 0, START_TAG: 1, STOP_TAG: 2}
-    ix_to_tag = {0: PAD_TAG, 1: START_TAG, 2: STOP_TAG}
-    for sentence, tags in training_data + test_data:
+    tag_to_ix = {PAD: 0, START_TAG: 1, STOP_TAG: 2}
+    ix_to_tag = {0: PAD, 1: START_TAG, 2: STOP_TAG}
+    for sentence, tags, _ in training_data + test_data:
         for tag in tags:
             if tag not in tag_to_ix:
                 tag_to_ix[tag] = len(tag_to_ix)
@@ -362,6 +433,7 @@ if __name__ == '__main__':
                 ix_to_word[len(ix_to_word)] = word
                 word_embeddings.append(np.random.uniform(-0.25, 0.25, embedding_size))
 
+    print(char_to_ix)
     print(tag_to_ix)
     print(ix_to_tag)
 
