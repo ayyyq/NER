@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data as Data
 import numpy as np
@@ -38,6 +39,8 @@ def preprocess(file_path):
 
             # prepare char dictionary
             w = pair[0]
+            if w.isdigit():
+                w = "0"
             char = []  # character index representations
             for c in w:
                 if c not in char_to_ix:
@@ -159,6 +162,7 @@ class BiLSTM_CRF(nn.Module):
 
         # Maps the output of the LSTM into tag space.
         self.hidden2tag = nn.Linear(hidden_dim, self.tagset_size)
+        self.linear = nn.Linear(self.tagset_size, self.tagset_size)
 
         # Matrix of transition parameters.  Entry i,j is the score of
         # transitioning *to* i *from* j.
@@ -175,6 +179,7 @@ class BiLSTM_CRF(nn.Module):
     def reset_parameters(self):
         # nn.init.xavier_normal_(self.word_embeds.weight)
         nn.init.xavier_normal_(self.hidden2tag.weight)
+        nn.init.xavier_normal_(self.linear.weight)
 
     def init_hidden(self, batch=1):
         return (torch.randn(2, batch, self.hidden_dim // 2).cuda(),
@@ -216,10 +221,11 @@ class BiLSTM_CRF(nn.Module):
         word_embed = self.word_embeds(sentence)  # [batch, seq_len, embed_dim]
         embeds = torch.cat((char_embed, word_embed), dim=-1)
 
-        # embeds = self.dropout(embeds)
+        embeds = self.dropout(embeds)
 
         lstm_out, hidden = self.lstm(embeds, hidden)  # lstm_out: [batch, seq_len, hidden_dim]
-        lstm_feats = self.hidden2tag(lstm_out)
+        lstm_feats = F.relu(self.hidden2tag(lstm_out))
+        lstm_feats = self.linear(lstm_feats)
         return lstm_feats  # [batch, seq_len, tag_size]
 
     def _score_sentence(self, feats, tags):
@@ -398,7 +404,7 @@ if __name__ == '__main__':
     PAD = "<PAD>"
     UNK = "<UNK>"
     EMBEDDING_DIM = 100
-    HIDDEN_DIM = 100
+    HIDDEN_DIM = 200
     CHAR_EMBEDDING_DIM = 100
     CHAR_HIDDEN_DIM = 50
     DROPOUT = 0.5
