@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data as Data
 import numpy as np
@@ -229,8 +230,8 @@ class BiLSTM_CRF(nn.Module):
         embeds = nn.utils.rnn.pack_padded_sequence(embeds, mask.sum(0).long())
         lstm_out, _ = self.lstm(embeds)  # [seq_len, batch, hidden_dim]
         lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out)
-        lstm_out = lstm_out * mask.unsqueeze(-1)
-        lstm_feats = self.hidden2tag(lstm_out) * mask.unsqueeze(-1)
+        lstm_feats = F.relu(self.hidden2tag(lstm_out))
+        lstm_feats = self.linear(lstm_feats) * mask.unsqueeze(-1)
         return lstm_feats  # [seq_len, batch, tag_size]
 
     def _score_sentence(self, feats, tags, mask):
@@ -460,12 +461,12 @@ if __name__ == '__main__':
     PAD = "<PAD>"
     UNK = "<UNK>"
     EMBEDDING_DIM = 100
-    HIDDEN_DIM = 200
-    CHAR_EMBEDDING_DIM = 100
+    HIDDEN_DIM = 100
+    CHAR_EMBEDDING_DIM = 50
     CHAR_HIDDEN_DIM = 50
     DROPOUT = 0.5
     BATCH_SIZE = 32
-    NUM_EPOCHS = 50
+    NUM_EPOCHS = 100
 
     max_seq_len = 150
     max_word_len = 25
